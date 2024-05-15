@@ -13,4 +13,4 @@ curated dataset. We analyzed the model predictions and found that its
 performance suffered on fibrous and vascular tumors due to their
 diverse anatomical location, size, and intensity heterogeneity.
 
-Dataets and Model weights will be published after the acceptance of the paper.
+Datasets and Model weights will be published after the acceptance of the paper.

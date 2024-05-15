@@ -27,7 +27,7 @@ import torchvision
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 # import lightly
-from backboned_unet import Unet
+#from backboned_unet import Unet
 # import pytorch_lightning as pl
 from sklearn.model_selection import train_test_split
 from logger import Logger
@@ -37,11 +37,14 @@ import utils
 import pandas as pd
 import pickle
 import cv2
-import segmentation_models_pytorch as smp
+#import segmentation_models_pytorch as smp
 from sklearn.model_selection import KFold
 import torchvision.transforms.functional as TF
 
-
+from sam_surgery import MedSAM_Lite_6ch, build_medsam_lite
+from segment_anything import sam_model_registry
+from accelerate import load_checkpoint_and_dispatch
+from accelerate import Accelerator
 # In[3]:
 
 
@@ -50,7 +53,7 @@ parser.add_argument('--test_size', type = float, default = 0.25)
 parser.add_argument('--gpus', default = '0')
 parser.add_argument('--fold', type = int, default = 0)
 parser.add_argument('--epoch', type = int, default = 4)
-parser.add_argument('--batch_size', type = int, default = 128)
+parser.add_argument('--batch_size', type = int, default = 64)
 parser.add_argument('--input_size', type = int, default = 256)
 parser.add_argument('--p_thresh', type = float, default = 0.0)
 parser.add_argument('--num_workers', type = int, default = 4)
@@ -278,7 +281,7 @@ test_transforms = A.Compose([
 ])
 
 
-df_consensus = pd.read_csv('STS_Public/image_metadata.csv')
+df_consensus = pd.read_csv('/scratch/reasatt/STS_public/image_metadata.csv')
 pids_filtered  = []
 '''
 for pid, group in df_consensus.groupby('PID'):
@@ -293,7 +296,7 @@ print('pids_filtered', len(pids_filtered))
 
 view_list = ['axial','coronal', 'sagittal']
 
-paths = sorted(glob('STS_Public/image_2_5d_isotropic_*_stride-1/*/*'))
+paths = sorted(glob('/scratch/reasatt/STS_public/image_2_5d_isotropic_*_stride-1/*/*'))
 print(len(paths))
 paths = [p for p in paths if p.split(os.sep)[-1][:7] in pids_filtered]
 print(len(paths))
@@ -330,9 +333,6 @@ def build_model(backbone, num_classes, device='cpu'):
     model.to(device)
     return model
 
-model = build_model(backbone='se_resnext50_32x4d', num_classes = 1)
-
-model.encoder.layer0.conv1 = torch.nn.Conv2d(6,64,kernel_size=(7,7), stride=(2,2), padding=(3,3), bias= False)
 
 df_label = pd.DataFrame(data= {
     'paths' : paths,
@@ -343,7 +343,8 @@ df_label = pd.DataFrame(data= {
 ) 
 df_label['view'] = df_label.paths.apply(lambda x: x.split(os.sep)[-3].split('_')[4])
 
-model_paths_unsorted = glob('../myxoid/model_data/{}/*.ckpt'.format(args.timestamp))
+model_paths_unsorted = glob('/tank/data/Project-reasatt/soft_tissue_tumor/model_data/{}/*.ckpt'.format(args.timestamp))
+print(model_paths_unsorted)
 epoch_num = [int(p.split('_')[-2].replace('epoch-','')) for p in model_paths_unsorted]
 model_paths = np.array(model_paths_unsorted)[np.argsort(epoch_num)]
 df_model_path = pd.DataFrame({
@@ -356,7 +357,23 @@ model_path = df_model_path.groupby(['fold', 'epoch']).get_group(
     ('fold-{}'.format(args.fold), 'epoch-{}'.format(args.epoch))
 ).path.item()
 
+'''
+state_dict = torch.load(model_path)
+for key in list(state_dict.keys()):
+    state_dict[key.replace('module.', '')] = state_dict.pop(key)    
+model.load_state_dict(state_dict)
+'''
+sam_model = build_medsam_lite('lite_medsam.pth')
+model = MedSAM_Lite_6ch(
+    sam_model.image_encoder, sam_model.mask_decoder, sam_model.prompt_encoder,
+    train_mode = 'finetune-decoder'
+)
+
+
+#accelerator = Accelerator()
+#model = accelerator.prepare(model)
 model.load_state_dict(torch.load(model_path))
+
 model = model.cuda()
 _=model.eval()
 
@@ -389,9 +406,12 @@ for (pid, v), df_group in df_label.groupby(['PID','view']):
     for img_batch, _ in dataloader:
         print('slices batch shape', img_batch.shape) 
         with torch.no_grad():
+            B,_, H_b, W_b = img_batch.shape
+            # set the bbox as the image size for fully automatic segmentation
+            boxes = torch.from_numpy(np.array([[0,0,W_b,H_b]]*B)).float().cuda()
             outputs = []
             for t1,t2,t3 in CFG_LIST:
-                out = model(tta1(tta2(tta3(img_batch.cuda(),t3),t2),t1))
+                out = model(tta1(tta2(tta3(img_batch.cuda(),t3),t2),t1),boxes)
                 out = out.detach().cpu()
                 out = tta3(tta2(tta1(out,-t1),-t2),-t3)
                 
@@ -443,7 +463,7 @@ for PID in tqdm(sorted(df_valid.PID.unique())):
     print('pred_vol', pred_vol.shape)
     print('computing dice ...')
     path_target = os.path.join(
-            'STS_Public/mask_isotropic_nii','{}_{}.nii.gz'.format(
+            '/scratch/reasatt/STS_public/mask_isotropic_nii','{}_{}.nii.gz'.format(
                 PID,
                 'T2'
             ))
@@ -464,7 +484,7 @@ df_dice = df_dice.sort_values(by = 'dice')
 print(df_dice.dice.to_list())
 print(df_dice.dice.mean())
 
-df_dice.to_csv(os.path.join('model_data', args.timestamp,
+df_dice.to_csv(os.path.join('/tank/data/Project-reasatt/soft_tissue_tumor/model_data', args.timestamp,
 'sts_full_image_metrics_fold-{}_epoch-{}_ps-{}_p-thresh-{}_tta-{}.csv'.format(
     args.fold,
     args.epoch,

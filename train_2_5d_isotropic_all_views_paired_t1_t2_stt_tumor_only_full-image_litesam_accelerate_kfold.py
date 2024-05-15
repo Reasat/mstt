@@ -38,7 +38,7 @@ from accelerate import PartialState, prepare_pippy
 from accelerate.utils import set_seed
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-
+from accelerate import DistributedDataParallelKwargs
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--test_size', type = float, default = 0.25)
@@ -66,14 +66,10 @@ seed_everything(args.seed)
 
 args = parser.parse_args()
 
-sys.setrecursionlimit(2500)
-accelerator = Accelerator(cpu=False, mixed_precision='fp16', split_batches = True)
-
-
 ### LOGGER ###
 TIME_STAMP=time.strftime('%Y-%m-%d-%H-%M-%S')
-dir_output = os.path.join('model_data', TIME_STAMP)
-os.makedirs(dir_output)
+dir_output = os.path.join('/tank/data/Project-reasatt/soft_tissue_tumor/model_data', TIME_STAMP)
+os.makedirs(dir_output, exist_ok = True)
 sys.stdout = Logger(os.path.join(dir_output,TIME_STAMP+'.log'))
 
 print(TIME_STAMP)
@@ -85,6 +81,19 @@ for arg in vars(args):
     with open(filepath_cfg,'w') as f:
         for arg in vars(args):
             f.write('{}: {}\n'.format(arg, getattr(args, arg)))
+
+############ Multi-GPU #############
+sys.setrecursionlimit(2500)
+
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+        cpu=False, 
+        mixed_precision='fp16', 
+        project_dir = dir_output,
+        #split_batches = True, 
+        kwargs_handlers=[ddp_kwargs]
+        )
+device = accelerator.device
 
 def format_mask_path(p):
     dir = p.split(os.sep)[-3]
@@ -108,10 +117,10 @@ def format_mask_path(p):
     return p_mask
 
 
-df_consensus = pd.read_csv('Radiomics_Research/consensus_information.csv')
+df_consensus = pd.read_csv('/scratch/reasatt/Radiomics_Research/consensus_information.csv')
 
 ###TRAIN TEST PARTITION###
-paths = glob('Radiomics_Research/image_2_5d_isotropic_*_stride-1/*/*')
+paths = glob('/scratch/reasatt/Radiomics_Research/image_2_5d_isotropic_*_stride-1/*/*')
 paths = [p for p in paths if args.img_type in p]
 
 print('check patients for issues',
@@ -136,7 +145,7 @@ print(df_meta.value_counts())
 print('filtering tumors ...')
 df_tumor_views = {}
 for view in ['axial', 'sagittal', 'coronal']:
-    df_tumor_count = pd.read_csv('Radiomics_Research/mask_isotropic_{}_tumor_pixel_count.csv'.format(view))
+    df_tumor_count = pd.read_csv('/scratch/reasatt/Radiomics_Research/mask_isotropic_{}_tumor_pixel_count.csv'.format(view))
     df_tumor_count = df_tumor_count[df_tumor_count['tumor_pixels']>args.thresh_tumor].reset_index(drop=True)
     df_tumor_count['PID'] = df_tumor_count.flnames.apply(lambda x: x.split('_')[0])
     df_tumor_count['InstanceNumber'] = df_tumor_count.flnames.apply(lambda x: x.split('_')[-1].split('.')[0])
@@ -272,13 +281,14 @@ for i_fold, item in enumerate(kfold.split(df_consensus)):
         )
 
 
+    print('fold: {}, train images: {}'.format(i_fold,len(dataset_train)))
     sam_model = build_medsam_lite('lite_medsam.pth')
     model = MedSAM_Lite_6ch(
         sam_model.image_encoder,
         sam_model.mask_decoder, 
         sam_model.prompt_encoder,
         args.train_mode
-    ).cuda()
+    )
 
     if args.resume_from is not None:
         print('loading model weights from', args.resume_from)
@@ -291,25 +301,26 @@ for i_fold, item in enumerate(kfold.split(df_consensus)):
     if args.loss_type == 'bce-dice':
         criterion = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
-    model, dataloader = accelerator.prepare(model, dataloader_train)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader_train)
 
-    model = model.cuda()
+    model = model
     model.train()
     losses = []
     print('train...')
     for epoch in range(args.epoch):
         running_loss = 0
         model.train()
-        for i, (img, mask) in enumerate(dataloader_train):
-            img = img.cuda()
-            mask = mask.unsqueeze(1).cuda().float()
+        for i, (img, mask) in enumerate(tqdm(dataloader_train)):
+            img = img
+            mask = mask.unsqueeze(1).float()
             B,_, H, W = mask.shape
             # set the bbox as the image size for fully automatic segmentation
-            boxes = torch.from_numpy(np.array([[0,0,W,H]]*B)).float().cuda()
+            boxes = torch.from_numpy(np.array([[0,0,W,H]]*B)).float()
             output = model(img,boxes)
-            loss = criterion(output, mask)
+            with accelerator.autocast():
+                loss = criterion(output, mask.to(device))
             optimizer.zero_grad()
-            loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
             running_loss += loss.item()
             loss_avg = running_loss/(i+1)
@@ -326,7 +337,7 @@ for i_fold, item in enumerate(kfold.split(df_consensus)):
                                     '{}_fold-{}_epoch-{}_loss-{:.4f}.ckpt'.format(
                                         TIME_STAMP, i_fold, epoch, loss_avg)) 
             print('saving model at', path_save)
-            torch.save(model.state_dict(), path_save)
+            accelerator.save(accelerator.unwrap_model(model).state_dict(), path_save)
 
     with open(os.path.join(dir_output,'{}_fold-{}_train_loss.txt'.format(i_fold,TIME_STAMP)), 'w') as f:
         for l in losses:

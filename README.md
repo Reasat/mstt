@@ -1,6 +1,8 @@
 **MSTT-199: MRI Dataset for Musculoskeletal Soft Tissue
 Tumor Segmentation** 
 
+https://www.arxiv.org/abs/2409.03110
+
 Accurate soft tissue tumor segmentation is vital for assessing tumor size,
 location, diagnosis, and response to treatment, thereby influencing patient outcomes.
 However, segmentation of these tumors requires clinical expertise, and an automated
